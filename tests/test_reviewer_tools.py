@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from agent.tools.add_finding import add_finding
 from agent.tools.list_findings import list_findings
+from agent.tools.resolve_finding_thread import resolve_finding_thread
 from agent.tools.update_finding import update_finding
 
 
@@ -16,7 +17,9 @@ def _config(**configurable_overrides: Any) -> dict[str, Any]:
             "thread_id": "tid-1",
             "head_sha": "sha-head",
             "diff_text": "",
-            "diff_line_set": {"foo.py": list(range(10, 41))},
+            "diff_line_set": {
+                "foo.py": {"RIGHT": set(range(10, 41)), "LEFT": set()},
+            },
         },
         "metadata": {},
     }
@@ -49,6 +52,69 @@ def test_add_finding_rejects_out_of_diff_lines() -> None:
             description="d",
             start_line=99,
             end_line=99,
+        )
+    assert result["success"] is False
+    assert "not part of the PR diff" in result["error"]
+
+
+def test_add_finding_accepts_left_side_anchor_on_old_line() -> None:
+    """A finding on a deleted (LEFT-side) line must validate against the
+    old-side line set, not the new-side. With only RIGHT lines in 10..40,
+    a LEFT anchor at the same number should still pass when the line is in
+    the old-side set."""
+    config = {
+        "configurable": {
+            "thread_id": "tid-1",
+            "head_sha": "sha-head",
+            "diff_text": "",
+            "diff_line_set": {
+                "foo.py": {"RIGHT": {10, 11, 12}, "LEFT": {50, 51}},
+            },
+        },
+        "metadata": {},
+    }
+    with (
+        patch("agent.tools.add_finding.get_config", return_value=config),
+        patch("agent.tools.add_finding.get_thread_id_from_runtime", return_value="tid-1"),
+        patch("agent.tools.add_finding.append_finding", new_callable=AsyncMock),
+    ):
+        result = add_finding(
+            severity="high",
+            confidence="high",
+            category="correctness",
+            file="foo.py",
+            description="deleted call to releaseResources()",
+            start_line=51,
+            end_line=51,
+            side="LEFT",
+        )
+    assert result["success"] is True
+
+
+def test_add_finding_rejects_left_anchor_outside_old_side_set() -> None:
+    """A LEFT anchor on a line that's not in the old-side hunk must be
+    rejected — same guard, just on the correct side."""
+    config = {
+        "configurable": {
+            "thread_id": "tid-1",
+            "head_sha": "sha-head",
+            "diff_text": "",
+            "diff_line_set": {
+                "foo.py": {"RIGHT": {10, 11, 12}, "LEFT": {50, 51}},
+            },
+        },
+        "metadata": {},
+    }
+    with patch("agent.tools.add_finding.get_config", return_value=config):
+        result = add_finding(
+            severity="high",
+            confidence="high",
+            category="correctness",
+            file="foo.py",
+            description="d",
+            start_line=99,
+            end_line=99,
+            side="LEFT",
         )
     assert result["success"] is False
     assert "not part of the PR diff" in result["error"]
@@ -129,6 +195,40 @@ def test_update_finding_rejects_invalid_status() -> None:
     with patch("agent.tools.update_finding.get_config", return_value=_config()):
         result = update_finding(finding_id="f_x", status="archived")
     assert result["success"] is False
+
+
+def test_resolve_finding_thread_resolves_all_known_threads() -> None:
+    finding = {
+        "id": "f1",
+        "status": "open",
+        "github_review_thread_ids": ["THREAD_1", "THREAD_2"],
+        "github_review_comment_ids": [11, 12],
+    }
+    update = AsyncMock(return_value={**finding, "status": "resolved"})
+    resolve = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "agent.tools.resolve_finding_thread.get_config",
+            return_value=_config(repo={"owner": "o", "name": "r"}, pr_number=7),
+        ),
+        patch("agent.tools.resolve_finding_thread.get_github_token", return_value="token"),
+        patch("agent.tools.resolve_finding_thread.get_thread_id_from_runtime", return_value="tid"),
+        patch("agent.tools.resolve_finding_thread.get_finding", AsyncMock(return_value=finding)),
+        patch("agent.tools.resolve_finding_thread.resolve_review_thread", resolve),
+        patch("agent.tools.resolve_finding_thread.update_finding_fields", update),
+    ):
+        result = resolve_finding_thread("f1", status="resolved")
+
+    assert result["success"] is True
+    assert result["resolved_thread_count"] == 2
+    assert [call.kwargs["thread_node_id"] for call in resolve.await_args_list] == [
+        "THREAD_1",
+        "THREAD_2",
+    ]
+    updates = update.await_args.args[2]
+    assert updates["github_thread_resolved"] is True
+    assert updates["github_resolved_thread_ids"] == ["THREAD_1", "THREAD_2"]
 
 
 def test_update_finding_rejects_empty_update() -> None:

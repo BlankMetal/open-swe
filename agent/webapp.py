@@ -9,6 +9,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -70,9 +71,7 @@ from .utils.slack import (
     format_slack_messages_for_prompt,
     get_slack_user_info,
     get_slack_user_names,
-    looks_like_slack_pr_review_command,
     parse_github_pr_url,
-    parse_slack_review_command,
     post_slack_thread_reply,
     post_slack_trace_reply,
     resolve_slack_links_in_context,
@@ -1283,23 +1282,6 @@ async def slack_webhook(request: Request, background_tasks: BackgroundTasks) -> 
     if bot_user_id and user_id == bot_user_id:
         return {"status": "ignored", "reason": "Event from this bot user"}
 
-    clean_text = strip_bot_mention(text, bot_user_id, bot_username=SLACK_BOT_USERNAME)
-    pr_ref = parse_slack_review_command(clean_text)
-    if pr_ref:
-        if not await _is_repo_enabled_for_review({"owner": pr_ref.owner, "name": pr_ref.repo}):
-            return {"status": "ignored", "reason": "Repository not enabled for review"}
-        background_tasks.add_task(process_slack_pr_review_request, pr_ref, channel_id, thread_ts)
-        return {"status": "accepted", "message": "Slack PR review request queued"}
-
-    if looks_like_slack_pr_review_command(clean_text):
-        background_tasks.add_task(
-            post_slack_thread_reply,
-            channel_id,
-            thread_ts,
-            "To request a PR review, use `@open-swe review https://github.com/OWNER/REPO/pull/NUMBER`.",
-        )
-        return {"status": "ignored", "reason": "Malformed Slack PR review command"}
-
     event_data = {
         "channel_id": channel_id,
         "thread_ts": thread_ts,
@@ -1593,14 +1575,21 @@ async def trigger_pr_review_from_ref(
         return {"success": queued, "queued": queued, "thread_id": thread_id, "pr_url": pr_url}
 
     logger.info("Creating reviewer run for thread %s from %s PR review request", thread_id, source)
-    await langgraph_client.runs.create(
+    run = await langgraph_client.runs.create(
         thread_id,
         "reviewer",
         input={"messages": [{"role": "user", "content": prompt}]},
         config={"configurable": configurable, "metadata": _AGENT_VERSION_METADATA},
         if_not_exists="create",
     )
+    await _store_current_reviewer_run_id(thread_id, run)
     return {"success": True, "queued": False, "thread_id": thread_id, "pr_url": pr_url}
+
+
+async def _store_current_reviewer_run_id(thread_id: str, run: Any) -> None:
+    run_id = run.get("run_id") if isinstance(run, dict) else None
+    if isinstance(run_id, str) and run_id:
+        await set_reviewer_thread_metadata(thread_id, extra={"current_reviewer_run_id": run_id})
 
 
 def _build_reviewer_configurable(
@@ -1687,6 +1676,33 @@ async def _dispatch_first_review_from_pr_payload(payload: dict[str, Any], *, sou
         repo_config.get("owner", ""), repo_config.get("name", ""), pr_number
     )
 
+    pr_meta: ReviewerPRMeta = {
+        "owner": repo_config.get("owner", ""),
+        "name": repo_config.get("name", ""),
+        "number": pr_number,
+        "url": pr_url,
+        "title": pr_title,
+        "head_ref": branch_name,
+        "base_ref": base_ref,
+    }
+    last_reviewed_sha = ""
+    if payload.get("action") == "ready_for_review":
+        metadata = await _get_thread_metadata_safe(thread_id)
+        if metadata is not None and metadata.get("kind") == REVIEWER_THREAD_KIND:
+            existing_last_reviewed_sha = metadata.get("last_reviewed_sha")
+            if isinstance(existing_last_reviewed_sha, str) and existing_last_reviewed_sha:
+                if existing_last_reviewed_sha == head_sha:
+                    await set_reviewer_thread_metadata(thread_id, pr=pr_meta, watch=True)
+                    logger.info(
+                        "Skipping ready_for_review auto-review for %s/%s#%s: "
+                        "head_sha unchanged from last_reviewed_sha",
+                        repo_config.get("owner"),
+                        repo_config.get("name"),
+                        pr_number,
+                    )
+                    return
+                last_reviewed_sha = existing_last_reviewed_sha
+
     app_token, app_token_expires_at = await get_github_app_installation_token_with_expiry()
     if not app_token:
         logger.warning("No GitHub App token available for reviewer dispatch")
@@ -1702,18 +1718,17 @@ async def _dispatch_first_review_from_pr_payload(payload: dict[str, Any], *, sou
         logger.warning("Could not persist bot token for reviewer thread %s", thread_id)
         return
 
-    pr_meta: ReviewerPRMeta = {
-        "owner": repo_config.get("owner", ""),
-        "name": repo_config.get("name", ""),
-        "number": pr_number,
-        "url": pr_url,
-        "title": pr_title,
-        "head_ref": branch_name,
-        "base_ref": base_ref,
-    }
     await set_reviewer_thread_metadata(thread_id, pr=pr_meta, watch=True)
 
-    prompt = build_github_pr_review_prompt(repo_config, pr_number, pr_url, base_sha, head_sha)
+    is_re_review = bool(last_reviewed_sha)
+    if is_re_review:
+        prompt = (
+            f"PR #{pr_number} has been marked ready for review. The new HEAD is "
+            f"{head_sha}. Reconcile existing findings against the new diff, add any "
+            f"net-new findings, and call `publish_review` once you're done."
+        )
+    else:
+        prompt = build_github_pr_review_prompt(repo_config, pr_number, pr_url, base_sha, head_sha)
     configurable = _build_reviewer_configurable(
         source=source,
         github_login=github_login,
@@ -1724,6 +1739,8 @@ async def _dispatch_first_review_from_pr_payload(payload: dict[str, Any], *, sou
         base_sha=base_sha,
         head_sha=head_sha,
         branch_name=branch_name,
+        re_review=is_re_review,
+        last_reviewed_sha=last_reviewed_sha,
     )
 
     thread_active = await is_thread_active(thread_id)
@@ -1733,13 +1750,14 @@ async def _dispatch_first_review_from_pr_payload(payload: dict[str, Any], *, sou
         return
 
     logger.info("Creating reviewer run for thread %s (source=%s)", thread_id, source)
-    await langgraph_client.runs.create(
+    run = await langgraph_client.runs.create(
         thread_id,
         "reviewer",
         input={"messages": [{"role": "user", "content": prompt}]},
         config={"configurable": configurable, "metadata": _AGENT_VERSION_METADATA},
         if_not_exists="create",
     )
+    await _store_current_reviewer_run_id(thread_id, run)
     logger.info("Reviewer run created for thread %s (source=%s)", thread_id, source)
 
 
@@ -1868,6 +1886,58 @@ async def _fetch_open_pr_for_branch(
         return None
     pr = data[0]
     return pr if isinstance(pr, dict) else None
+
+
+def _normalized_diff_hash(diff_text: str) -> str:
+    normalized = "\n".join(
+        line.rstrip() for line in diff_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+async def _fetch_compare_diff(
+    repo_config: dict[str, str], base_ref: str, head_ref: str, *, token: str
+) -> str | None:
+    owner = repo_config.get("owner", "")
+    repo = repo_config.get("name", "")
+    if not owner or not repo or not base_ref or not head_ref:
+        return None
+
+    base = quote(base_ref, safe="")
+    head = quote(head_ref, safe="")
+    headers = {
+        "Accept": "application/vnd.github.diff",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient() as http_client:
+        try:
+            response = await http_client.get(
+                f"https://api.github.com/repos/{owner}/{repo}/compare/{base}...{head}",
+                headers=headers,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            logger.exception(
+                "Failed to fetch compare diff for %s/%s %s...%s", owner, repo, base_ref, head_ref
+            )
+            return None
+    return response.text
+
+
+async def _is_pr_diff_unchanged_since_last_review(
+    repo_config: dict[str, str],
+    *,
+    base_ref: str,
+    last_reviewed_sha: str,
+    head_sha: str,
+    token: str,
+) -> bool:
+    previous_diff = await _fetch_compare_diff(repo_config, base_ref, last_reviewed_sha, token=token)
+    current_diff = await _fetch_compare_diff(repo_config, base_ref, head_sha, token=token)
+    if previous_diff is None or current_diff is None:
+        return False
+    return _normalized_diff_hash(previous_diff) == _normalized_diff_hash(current_diff)
 
 
 async def _get_thread_metadata_safe(thread_id: str) -> dict[str, Any] | None:
@@ -2018,6 +2088,26 @@ async def process_github_push_event(payload: dict[str, Any]) -> None:
     if isinstance(last_reviewed_sha, str) and last_reviewed_sha == head_sha:
         logger.info("Push to %s ignored: head_sha unchanged from last_reviewed_sha", head_ref)
         return
+    thread_active = await is_thread_active(thread_id)
+    if (
+        not thread_active
+        and isinstance(last_reviewed_sha, str)
+        and last_reviewed_sha
+        and await _is_pr_diff_unchanged_since_last_review(
+            repo_config,
+            base_ref=base_ref,
+            last_reviewed_sha=last_reviewed_sha,
+            head_sha=head_sha,
+            token=app_token,
+        )
+    ):
+        await set_reviewer_thread_metadata(thread_id, last_reviewed_sha=head_sha)
+        logger.info(
+            "Push to %s ignored: PR diff unchanged since last reviewed SHA %s",
+            head_ref,
+            last_reviewed_sha,
+        )
+        return
 
     langgraph_client = get_client(url=LANGGRAPH_URL)
     if not await _ensure_thread_exists_for_metadata(thread_id, langgraph_client):
@@ -2058,20 +2148,20 @@ async def process_github_push_event(payload: dict[str, Any]) -> None:
         last_reviewed_sha=last_reviewed_sha if isinstance(last_reviewed_sha, str) else "",
     )
 
-    thread_active = await is_thread_active(thread_id)
     if thread_active:
         logger.info("Reviewer thread %s busy, queuing push re-review", thread_id)
         await queue_message_for_thread(thread_id, re_review_prompt)
         return
 
     logger.info("Creating push re-review run for thread %s", thread_id)
-    await langgraph_client.runs.create(
+    run = await langgraph_client.runs.create(
         thread_id,
         "reviewer",
         input={"messages": [{"role": "user", "content": re_review_prompt}]},
         config={"configurable": configurable, "metadata": _AGENT_VERSION_METADATA},
         if_not_exists="create",
     )
+    await _store_current_reviewer_run_id(thread_id, run)
 
 
 async def _refresh_thread_github_token_after_401(thread_id: str, email: str) -> str | None:
@@ -2175,12 +2265,24 @@ async def process_github_pr_comment(payload: dict[str, Any], event_type: str) ->
             else:
                 logger.warning("Failed to persist branch_name metadata for thread %s", thread_id)
 
+    comment = payload.get("comment") or payload.get("review", {})
+    is_review_request, _pr_url_override = parse_github_review_command(comment.get("body") or "")
     email = GITHUB_USER_EMAIL_MAP.get(github_login, "")
-    if not email:
+    if email:
+        github_token = await _get_or_resolve_thread_github_token(thread_id, email)
+    elif is_review_request:
+        github_token, expires_at = await get_github_app_installation_token_with_expiry()
+        if github_token:
+            try:
+                await persist_encrypted_github_token(thread_id, github_token, expires_at=expires_at)
+            except Exception:
+                logger.warning(
+                    "Could not persist bot token for PR review request thread %s", thread_id
+                )
+    else:
         logger.warning("No email mapping for GitHub user '%s', skipping", github_login)
         return
 
-    github_token = await _get_or_resolve_thread_github_token(thread_id, email)
     if not github_token:
         logger.warning("No GitHub token for thread %s, skipping", thread_id)
         return
@@ -2526,14 +2628,6 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
         "pull_request_review_comment",
         "pull_request_review",
     }:
-        is_review_command, pr_url_override = parse_github_review_command(comment_body)
-        if is_review_command:
-            if not await _is_repo_enabled_for_review(webhook_repo_config):
-                return {"status": "ignored", "reason": "Repository not enabled for review"}
-            background_tasks.add_task(
-                process_github_pr_review_command, payload, event_type, pr_url_override
-            )
-            return {"status": "accepted", "message": "Processing GitHub PR review command"}
         background_tasks.add_task(process_github_pr_comment, payload, event_type)
         return {"status": "accepted", "message": f"Processing {event_type} event"}
 
